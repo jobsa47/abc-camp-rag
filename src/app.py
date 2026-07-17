@@ -3,21 +3,29 @@
 import os
 import sys
 import re
+import json
 from collections import Counter
 
 import pandas as pd
 import numpy as np
 # pyrefly: ignore [missing-import]
 import plotly.express as px
+# pyrefly: ignore [missing-import]
 import plotly.graph_objects as go
+# pyrefly: ignore [missing-import]
 from plotly.subplots import make_subplots
+# pyrefly: ignore [missing-import]
 import streamlit as st
+# pyrefly: ignore [missing-import]
 from wordcloud import WordCloud
+# pyrefly: ignore [missing-import]
 import matplotlib.pyplot as plt
+# pyrefly: ignore [missing-import]
 from openai import OpenAI
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from update_data import update_bestseller_descriptions
+import vector_db
 
 # ── 페이지 설정 ──────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -198,8 +206,9 @@ def render_metric(label: str, value: str):
 
 
 def make_wordcloud(text: str) -> plt.Figure:
+    font_path = "C:/Windows/Fonts/malgun.ttf" if os.name == "nt" else None
     wc = WordCloud(
-        font_path="C:/Windows/Fonts/malgun.ttf",
+        font_path=font_path,
         width=900,
         height=400,
         background_color="white",
@@ -274,18 +283,280 @@ def search_books(df: pd.DataFrame, query: str, has_intro: bool, top_n: int = 10)
 
 
 def get_groq_response(client: OpenAI, model: str, system_prompt: str, user_message: str, book_context: str) -> str:
-    """Groq API를 호출하여 챗봇 응답을 생성한다."""
+    """Groq API를 호출하여 챗봇 응답을 생성한다. 함수 호출이 필요하면 도구를 실행하고 최종 응답을 생성한다."""
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": f"[도서 데이터베이스]\n{book_context}\n\n[사용자 질문]\n{user_message}"},
     ]
+
+    # 1차 호출: 함수 호출이 필요한지 판단
     response = client.chat.completions.create(
+        model=model,
+        messages=messages,
+        tools=TOOLS,
+        tool_choice="auto",
+        temperature=0.7,
+        max_tokens=2048,
+    )
+
+    choice = response.choices[0]
+
+    # 함수 호출이 없으면 그대로 반환
+    if choice.finish_reason != "tool_calls" or not choice.message.tool_calls:
+        return choice.message.content or ""
+
+    # 함수 호출 처리
+    messages.append(choice.message)
+
+    for tool_call in choice.message.tool_calls:
+        fn_name = tool_call.function.name
+        try:
+            fn_args = json.loads(tool_call.function.arguments)
+        except json.JSONDecodeError:
+            fn_args = {}
+
+        tool_result = execute_tool(fn_name, fn_args)
+
+        messages.append({
+            "role": "tool",
+            "tool_call_id": tool_call.id,
+            "content": tool_result,
+        })
+
+    # 2차 호출: 함수 결과를 바탕으로 최종 응답 생성
+    final_response = client.chat.completions.create(
         model=model,
         messages=messages,
         temperature=0.7,
         max_tokens=2048,
     )
-    return response.choices[0].message.content
+
+    return final_response.choices[0].message.content or ""
+
+
+# ── 함수 호출(Function Calling) 도구 정의 ───────────────────────────────────
+# DataFrame을 전역이 아닌 캐시된 세션에서 접근하기 위한 헬퍼
+_df_cache: pd.DataFrame = pd.DataFrame()
+
+
+def _set_df_cache(df: pd.DataFrame):
+    global _df_cache
+    _df_cache = df.copy()
+
+
+def tool_price_stats(min_price: float | None = None, max_price: float | None = None, top_n: int = 10) -> str:
+    """지정된 가격 범위 내 도서의 가격 통계와 목록을 반환한다.
+
+    Args:
+        min_price: 최소 가격 (None이면 전체 범위 사용).
+        max_price: 최대 가격 (None이면 전체 범위 사용).
+        top_n: 반환할 도서 수.
+
+    Returns:
+        JSON 문자열 형태의 가격 통계 및 도서 목록.
+    """
+    df = _df_cache
+    if df.empty:
+        return '{"error": "데이터가 로드되지 않았습니다."}'
+
+    filtered = df.copy()
+    if min_price is not None:
+        filtered = filtered[filtered["판매가(원)"] >= min_price]
+    if max_price is not None:
+        filtered = filtered[filtered["판매가(원)"] <= max_price]
+
+    if filtered.empty:
+        return json.dumps({"message": "해당 가격 범위에 도서가 없습니다.", "min_price": min_price, "max_price": max_price}, ensure_ascii=False)
+
+    stats = {
+        "조회_범위": f"{int(filtered['판매가(원)'].min()):,}원 ~ {int(filtered['판매가(원)'].max()):,}원",
+        "총_도서_수": int(len(filtered)),
+        "평균_가격": int(filtered["판매가(원)"].mean()),
+        "중앙값_가격": int(filtered["판매가(원)"].median()),
+        "최저_가격": int(filtered["판매가(원)"].min()),
+        "최고_가격": int(filtered["판매가(원)"].max()),
+        "평균_평점": round(filtered["평점"].mean(), 2) if filtered["평점"].notna().any() else None,
+        "총_리뷰수": int(filtered["리뷰수"].sum()),
+        "도서_목록": [],
+    }
+
+    for _, row in filtered.sort_values("판매가(원)").head(top_n).iterrows():
+        stats["도서_목록"].append({
+            "순위": int(row["순위"]),
+            "제목": str(row["도서명"]),
+            "저자": str(row["저자"]),
+            "출판사": str(row["출판사"]),
+            "가격": int(row["판매가(원)"]),
+            "평점": float(row["평점"]) if pd.notna(row["평점"]) else None,
+            "리뷰수": int(row["리뷰수"]),
+            "링크": str(row["상세링크"]),
+        })
+
+    return json.dumps(stats, ensure_ascii=False, indent=2)
+
+
+def tool_sales_ranking(start_rank: int = 1, end_rank: int = 20) -> str:
+    """지정된 순위 범위 내 도서의 판매 순위 목록을 반환한다.
+
+    Args:
+        start_rank: 시작 순위 (이상).
+        end_rank: 종료 순위 (이하).
+
+    Returns:
+        JSON 문자열 형태의 판매 순위 목록.
+    """
+    df = _df_cache
+    if df.empty:
+        return '{"error": "데이터가 로드되지 않았습니다."}'
+
+    filtered = df[(df["순위"] >= start_rank) & (df["순위"] <= end_rank)]
+
+    if filtered.empty:
+        return json.dumps({"message": "해당 순위 범위에 도서가 없습니다.", "start_rank": start_rank, "end_rank": end_rank}, ensure_ascii=False)
+
+    result = {
+        "조회_범위": f"{start_rank}위 ~ {end_rank}위",
+        "총_도서_수": int(len(filtered)),
+        "평균_가격": int(filtered["판매가(원)"].mean()),
+        "평균_평점": round(filtered["평점"].mean(), 2) if filtered["평점"].notna().any() else None,
+        "평균_리뷰수": int(filtered["리뷰수"].mean()),
+        "판매_순위_목록": [],
+    }
+
+    for _, row in filtered.sort_values("순위").iterrows():
+        result["판매_순위_목록"].append({
+            "순위": int(row["순위"]),
+            "제목": str(row["도서명"]),
+            "저자": str(row["저자"]),
+            "출판사": str(row["출판사"]),
+            "가격": int(row["판매가(원)"]),
+            "평점": float(row["평점"]) if pd.notna(row["평점"]) else None,
+            "리뷰수": int(row["리뷰수"]),
+            "링크": str(row["상세링크"]),
+        })
+
+    return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+def tool_price_percentile(target_price: float) -> str:
+    """특정 가격이 전체 베스트셀러 중 어느 수준에 해당하는지 분석한다.
+
+    Args:
+        target_price: 분석할 가격.
+
+    Returns:
+        가격 분위수 및 비교 정보를 포함하는 JSON 문자열.
+    """
+    df = _df_cache
+    if df.empty:
+        return '{"error": "데이터가 로드되지 않았습니다."}'
+
+    prices = df["판매가(원)"].dropna()
+    percentile = (prices < target_price).sum() / len(prices) * 100
+
+    cheaper = df[df["판매가(원)"] < target_price].sort_values("판매가(원)", ascending=False).head(3)
+    expensive = df[df["판매가(원)"] > target_price].sort_values("판매가(원)").head(3)
+
+    result = {
+        "입력_가격": f"{int(target_price):,}원",
+        "전체_가격_범위": f"{int(prices.min()):,}원 ~ {int(prices.max()):,}원",
+        "평균_가격": f"{int(prices.mean()):,}원",
+        "중앙값_가격": f"{int(prices.median()):,}원",
+        "분위수": f"{percentile:.1f}% (전체 {len(df)}권 중 상위 {100 - percentile:.1f}%)",
+        "이보다_저렴한_도서_수": int((prices < target_price).sum()),
+        "이보다_비싼_도서_수": int((prices > target_price).sum()),
+        "가까운_저가_도서": [
+            {"제목": str(r["도서명"]), "가격": int(r["판매가(원)"])}
+            for _, r in cheaper.iterrows()
+        ],
+        "가까운_고가_도서": [
+            {"제목": str(r["도서명"]), "가격": int(r["판매가(원)"])}
+            for _, r in expensive.iterrows()
+        ],
+    }
+
+    return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+# 함수 호출 도구 스키마
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "tool_price_stats",
+            "description": "특정 가격 범위 내 도서의 가격 통계(평균, 중앙값, 최저/최고가)와 도서 목록을 조회한다. 사용자가 '가격', '얼마', '원대', '만원 이하' 등 가격에 대해 물어볼 때 호출한다.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "min_price": {
+                        "type": "number",
+                        "description": "최소 가격 (원). 예: 10000",
+                    },
+                    "max_price": {
+                        "type": "number",
+                        "description": "최대 가격 (원). 예: 30000",
+                    },
+                    "top_n": {
+                        "type": "integer",
+                        "description": "반환할 도서 수 (기본 10)",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "tool_sales_ranking",
+            "description": "특정 순위 범위 내 도서의 판매 순위 목록을 조회한다. 사용자가 '순위', '판매 순위', '몇 위', '상위 N권' 등 판매 순위에 대해 물어볼 때 호출한다.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "start_rank": {
+                        "type": "integer",
+                        "description": "시작 순위 (이상). 예: 1",
+                    },
+                    "end_rank": {
+                        "type": "integer",
+                        "description": "종료 순위 (이하). 예: 20",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "tool_price_percentile",
+            "description": "특정 가격이 전체 베스트셀러 중 어느 수준(분위수)에 해당하는지 분석한다. 사용자가 특정 도서의 가격이 비싼지/싼지 비교할 때 호출한다.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "target_price": {
+                        "type": "number",
+                        "description": "분석할 가격 (원). 예: 25000",
+                    },
+                },
+                "required": ["target_price"],
+            },
+        },
+    },
+]
+
+
+def execute_tool(tool_name: str, arguments: dict) -> str:
+    """함수 호출 결과를 반환한다."""
+    fn_map = {
+        "tool_price_stats": tool_price_stats,
+        "tool_sales_ranking": tool_sales_ranking,
+        "tool_price_percentile": tool_price_percentile,
+    }
+    fn = fn_map.get(tool_name)
+    if fn is None:
+        return json.dumps({"error": f"알 수 없는 함수: {tool_name}"}, ensure_ascii=False)
+    return fn(**arguments)
 
 
 # ── 메인 ──────────────────────────────────────────────────────────────────────
@@ -335,6 +606,27 @@ def main():
             f"- 평균 가격: **{int(df['판매가(원)'].mean()):,}원**\n"
             f"- 총 리뷰: **{df['리뷰수'].sum():,}건**"
         )
+
+        st.divider()
+        st.markdown("### 벡터 DB (ChromaDB + KLUE-BERT)")
+        if st.button("벡터 DB 구축/업데이트", use_container_width=True):
+            with st.spinner("KLUE-BERT 모델 로딩 및 임베딩 생성 중..."):
+                st.session_state.vector_collection = vector_db.init_vector_db(df, has_intro)
+            st.success(f"벡터 DB 구축 완료! ({st.session_state.vector_collection.count()}권 인덱싱)")
+            st.rerun()
+
+        if "vector_collection" in st.session_state and st.session_state.vector_collection is not None:
+            st.info(f"인덱싱된 도서: **{st.session_state.vector_collection.count()}**권")
+        else:
+            # ChromaDB 디렉토리 존재 여부로 빠르게 확인 (모델 로딩 없이)
+            chroma_exists = os.path.exists(os.path.join(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                "data", "chroma_db"
+            ))
+            if chroma_exists:
+                st.info("벡터 DB가 감지되었습니다. 챗봇 탭에서 자동으로 로드됩니다.")
+            else:
+                st.warning("벡터 DB가 없습니다. 위 버튼으로 구축하세요.")
 
         st.divider()
         st.markdown("### Groq API 설정")
@@ -635,6 +927,15 @@ def main():
         st.markdown("### 💬 도서 추천 챗봇")
         st.caption("GROQ API를 활용하여 베스트셀러 데이터 기반으로 도서를 추천합니다. 사이드바에서 API 키를 입력하세요.")
 
+        # 챗봇 탭 진입 시 벡터 DB 자동 로드 (최초 1회만)
+        if "vector_collection" not in st.session_state or st.session_state.vector_collection is None:
+            with st.spinner("벡터 DB 로딩 중... (최초 실행 시 모델 로딩에 시간이 소요됩니다)"):
+                try:
+                    st.session_state.vector_collection = vector_db.init_vector_db(df, has_intro)
+                    st.success(f"벡터 DB 로드 완료! ({st.session_state.vector_collection.count()}권)")
+                except Exception as e:
+                    st.warning(f"벡터 DB 로드 실패: {e}. 키워드 검색으로 대체됩니다.")
+
         if not groq_api_key:
             st.info("사이드바에서 **Groq API Key**를 입력해 주세요.  \nhttps://console.groq.com 에서 무료로 발급 가능합니다.")
         else:
@@ -647,9 +948,14 @@ def main():
             # 시스템 프롬프트
             SYSTEM_PROMPT = (
                 "당신은 YES24 IT/모바일 베스트셀러 도서 추천 전문가입니다.\n"
-                "아래 [도서 데이터베이스]에 있는 도서 정보를 바탕으로 사용자의 질문에 친절하게 답변하세요.\n"
-                "도서를 추천할 때는 반드시 아래 형식을 지켜주세요:\n"
-                "- 도서명, 저자, 출판사, 가격, 평점, 리뷰수를 포함하세요.\n"
+                "아래 [도서 데이터베이스]에 있는 도서 정보를 바탕으로 사용자의 질문에 친절하게 답변하세요.\n\n"
+                "[함수 호출 규칙]\n"
+                "- 사용자가 가격에 대해 질문하면 tool_price_stats를 호출하여 정확한 수치를 답변하세요.\n"
+                "- 사용자가 판매 순위에 대해 질문하면 tool_sales_ranking을 호출하여 순위 정보를 답변하세요.\n"
+                "- 사용자가 특정 가격이 비싼지/싼지 물어보면 tool_price_percentile을 호출하세요.\n"
+                "- 함수 호출 결과를 바탕으로 구체적인 수치와 함께 답변하세요.\n\n"
+                "[도서 추천 규칙]\n"
+                "- 도서를 추천할 때는 도서명, 저자, 출판사, 가격, 평점, 리뷰수를 포함하세요.\n"
                 "- 해당 도서의 YES24 링크를 포함하세요 (링크: https://... 형식).\n"
                 "추천할 만한 도서가 없으면 \"현재 데이터베이스에 해당 조건에 맞는 도서가 없습니다.\"라고 솔직하게 답변하세요.\n"
                 "답변은 한국어로 작성하고, 친근하고 전문적인 톤으로 대화하세요.\n"
@@ -693,21 +999,35 @@ def main():
                     unsafe_allow_html=True,
                 )
 
-                # 관련 도서 검색
-                matched = search_books(df, user_input, has_intro, top_n=10)
-                book_context = build_book_context(matched, has_intro, max_books=10)
+                # 벡터 검색으로 관련 도서 찾기
+                collection = st.session_state.get("vector_collection")
+                if collection is not None and collection.count() > 0:
+                    search_results = vector_db.search_similar(collection, user_input, n_results=8)
+                    book_context = "\n".join(search_results.get("documents", [[]])[0]) if search_results.get("documents") else ""
 
-                # 추천 도서 목록 업데이트
-                st.session_state.chat_books = []
-                for _, row in matched.iterrows():
-                    st.session_state.chat_books.append({
-                        "title": row["도서명"],
-                        "url": row["상세링크"],
-                    })
+                    # 추천 도서 목록 업데이트
+                    st.session_state.chat_books = []
+                    if search_results.get("metadatas"):
+                        for meta in search_results["metadatas"][0]:
+                            st.session_state.chat_books.append({
+                                "title": meta["title"],
+                                "url": meta["url"],
+                            })
+                else:
+                    # 벡터 DB 없으면 기존 키워드 검색으로 폴백
+                    matched = search_books(df, user_input, has_intro, top_n=8)
+                    book_context = build_book_context(matched, has_intro, max_books=8)
+                    st.session_state.chat_books = []
+                    for _, row in matched.iterrows():
+                        st.session_state.chat_books.append({
+                            "title": row["도서명"],
+                            "url": row["상세링크"],
+                        })
 
-                # Groq API 호출
+                # Groq API 호출 (함수 호출 지원)
                 with st.spinner("생각 중..."):
                     try:
+                        _set_df_cache(df)
                         client = OpenAI(api_key=groq_api_key, base_url="https://api.groq.com/openai/v1")
                         bot_reply = get_groq_response(client, groq_model, SYSTEM_PROMPT, user_input, book_context)
                     except Exception as e:
