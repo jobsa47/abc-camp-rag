@@ -1,0 +1,32 @@
+# Office documents
+*.xlsx
+*.xls
+*.pptx
+*.ppt
+*.docx
+*.doc
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Node.js
+node_modules/
+package-lock.json
+
+# OpenCode / Agent config
+.omo/
+.opencode/
+
+# Generated data (reproducible)
+data/chroma_db/
+data/analysis.json
+
+# Output files (generated)
+output/
