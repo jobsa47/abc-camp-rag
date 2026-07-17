@@ -206,7 +206,16 @@ def render_metric(label: str, value: str):
 
 
 def make_wordcloud(text: str) -> plt.Figure:
-    font_path = "C:/Windows/Fonts/malgun.ttf" if os.name == "nt" else None
+    font_path = None
+    if os.name == "nt":
+        font_path = "C:/Windows/Fonts/malgun.ttf"
+    else:
+        for candidate in ["/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+                          "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+                          "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc"]:
+            if os.path.exists(candidate):
+                font_path = candidate
+                break
     wc = WordCloud(
         font_path=font_path,
         width=900,
@@ -630,12 +639,18 @@ def main():
 
         st.divider()
         st.markdown("### Groq API 설정")
-        groq_api_key = st.text_input(
-            "Groq API Key",
-            type="password",
-            placeholder="gsk_...",
-            help="https://console.groq.com 에서 발급받은 API 키를 입력하세요.",
-        )
+
+        groq_api_key = ""
+        if "GROQ_API_KEY" in st.secrets:
+            groq_api_key = st.secrets["GROQ_API_KEY"]
+            st.info("secrets에서 API 키를 로드했습니다.")
+        else:
+            groq_api_key = st.text_input(
+                "Groq API Key",
+                type="password",
+                placeholder="gsk_...",
+                help="https://console.groq.com 에서 발급받은 API 키를 입력하세요.",
+            )
         groq_model = st.selectbox(
             "모델 선택",
             ["llama-3.3-70b-versatile", "llama-3.1-8b-instant", "gemma2-9b-it"],
@@ -929,9 +944,13 @@ def main():
 
         # 챗봇 탭 진입 시 벡터 DB 자동 로드 (최초 1회만)
         if "vector_collection" not in st.session_state or st.session_state.vector_collection is None:
-            with st.spinner("벡터 DB 로딩 중... (최초 실행 시 모델 로딩에 시간이 소요됩니다)"):
+            with st.spinner("벡터 DB 로딩 중..."):
                 try:
-                    st.session_state.vector_collection = vector_db.init_vector_db(df, has_intro)
+                    loaded = vector_db.load_existing_db()
+                    if loaded is not None:
+                        st.session_state.vector_collection = loaded
+                    else:
+                        st.session_state.vector_collection = vector_db.init_vector_db(df, has_intro)
                     st.success(f"벡터 DB 로드 완료! ({st.session_state.vector_collection.count()}권)")
                 except Exception as e:
                     st.warning(f"벡터 DB 로드 실패: {e}. 키워드 검색으로 대체됩니다.")

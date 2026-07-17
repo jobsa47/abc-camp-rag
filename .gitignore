@@ -18,15 +18,16 @@ env/
 
 # Node.js
 node_modules/
-package-lock.json
 
 # OpenCode / Agent config
 .omo/
 .opencode/
 
 # Generated data (reproducible)
-data/chroma_db/
 data/analysis.json
 
 # Output files (generated)
 output/
+
+# Streamlit secrets (contains API keys)
+.streamlit/secrets.toml

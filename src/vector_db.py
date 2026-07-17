@@ -108,6 +108,37 @@ def init_vector_db(df: pd.DataFrame, has_intro: bool) -> chromadb.Collection:
     return _collection
 
 
+def load_existing_db() -> chromadb.Collection | None:
+    """이미 구축된 ChromaDB가 있으면 임베딩 모델 없이 컬렉션을 로드한다.
+
+    배포 환경에서 KLUE-BERT 모델 다운로드 없이 벡터 DB를 사용할 때 활용한다.
+    단, 쿼리 시 동일한 임베딩 함수가 필요하므로 SentenceTransformer 모델은 로드된다.
+
+    Returns:
+        기존 컬렉션이 있으면 반환, 없으면 None.
+    """
+    global _client, _collection
+
+    if _collection is not None and _collection.count() > 0:
+        return _collection
+
+    if not os.path.exists(DB_PATH):
+        return None
+
+    if _client is None:
+        _client = chromadb.PersistentClient(path=DB_PATH)
+
+    try:
+        ef = get_embedding_function()
+        _collection = get_or_create_collection(_client, ef)
+        if _collection.count() > 0:
+            return _collection
+    except Exception:
+        pass
+
+    return None
+
+
 def search_similar(collection: chromadb.Collection, query: str, n_results: int = 8) -> dict:
     """쿼리와 유사한 도서를 벡터 검색으로 찾는다.
 
